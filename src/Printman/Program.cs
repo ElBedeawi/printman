@@ -26,14 +26,31 @@ public static class Program
         // 2. Dispatch between Interactive mode and CLI mode
         try
         {
-            if (args.Length == 0)
+            var parsedArgs = args.Length == 0 ? null : CommandLineParser.Parse(args);
+
+#if !WINDOWS
+            // Everything but help / version talks to cupsd; explain and stop early when it is not there
+            if (parsedArgs == null || CupsReadiness.Needs(parsedArgs.Command))
+            {
+                var exitCode = await CupsReadiness.EnsureAsync(
+                    serviceProvider.GetRequiredService<CupsClient>(),
+                    serviceProvider.GetRequiredService<IExternalTools>(),
+                    Console.ReadLine,
+                    Console.Out,
+                    interactive: !Console.IsInputRedirected && !Console.IsOutputRedirected);
+                if (exitCode is int code)
+                {
+                    return code;
+                }
+            }
+#endif
+
+            if (parsedArgs == null)
             {
                 var wizard = serviceProvider.GetRequiredService<InteractiveWizard>();
                 await wizard.RunAsync();
                 return 0;
             }
-
-            var parsedArgs = CommandLineParser.Parse(args);
 
             if (parsedArgs.Command == Core.Models.CliCommandType.Interactive)
             {
@@ -73,6 +90,7 @@ public static class Program
         services.AddSingleton<IFirewallInspector, WindowsFirewallInspector>();
 #else
         services.AddSingleton<CupsClient>();
+        services.AddSingleton<IExternalTools, ExternalTool>();
         services.AddSingleton<IPrinterDiscoveryService, CupsPrinterDiscoveryService>();
         services.AddTransient<IPrintService, CupsPrintService>();
         services.AddSingleton<IPrintQueueService, CupsPrintQueueService>();

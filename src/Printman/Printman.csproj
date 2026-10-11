@@ -37,7 +37,8 @@
   </PropertyGroup>
 
   <ItemGroup Condition="'$(PrintmanWindows)' == 'true'">
-    <Compile Remove="**\*.Unix.cs;Services\Cups\**" />
+    <!-- Services\Cups\ is portable BCL code and stays in the Windows build so the unit tests cover it -->
+    <Compile Remove="**\*.Unix.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(PrintmanWindows)' != 'true'">

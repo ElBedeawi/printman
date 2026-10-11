@@ -13,12 +13,14 @@ public sealed class CupsPrintService(
     IPrinterDiscoveryService printerDiscovery,
     IDocumentRendererResolver rendererResolver,
     IPrintJobValidator validator,
-    CupsClient cups) : IPrintService
+    CupsClient cups,
+    IExternalTools tools) : IPrintService
 {
     private readonly IPrinterDiscoveryService _printerDiscovery = printerDiscovery;
     private readonly IDocumentRendererResolver _rendererResolver = rendererResolver;
     private readonly IPrintJobValidator _validator = validator;
     private readonly CupsClient _cups = cups;
+    private readonly IExternalTools _tools = tools;
 
     public async Task<PrintJobResult> PrintAsync(
         PrintJobRequest request,
@@ -181,7 +183,7 @@ public sealed class CupsPrintService(
         IProgress<string>? progress,
         CancellationToken ct)
     {
-        var cupsfilter = ExternalTool.Find("cupsfilter");
+        var cupsfilter = _tools.Find("cupsfilter");
         if (cupsfilter == null)
         {
             return PrintJobResult.Failed(printer.Name, "Print-to-file needs 'cupsfilter' (part of CUPS); it was not found.");
@@ -222,7 +224,7 @@ public sealed class CupsPrintService(
             }
             args.Add(request.FilePath);
 
-            var result = await ExternalTool.RunAsync(cupsfilter, args, stdoutFile: fullOutputPath, ct: ct);
+            var result = await _tools.RunAsync(cupsfilter, args, stdoutFile: fullOutputPath, ct: ct);
             if (result.ExitCode != 0 || !File.Exists(fullOutputPath) || new FileInfo(fullOutputPath).Length == 0)
             {
                 var detail = result.StandardError

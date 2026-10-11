@@ -9,6 +9,16 @@ namespace Printman.Services.Cups;
 public sealed class CupsException(string message, short? ippStatus = null) : Exception(message)
 {
     public short? IppStatus { get; } = ippStatus;
+
+    /// <summary>True when CUPS could not be reached at all (not installed, not running, wrong CUPS_SERVER).</summary>
+    public bool IsUnreachable => IppStatus == null && Message.StartsWith("Cannot reach", StringComparison.Ordinal);
+}
+
+/// <summary>Where the CUPS scheduler is: a domain socket path, or a TCP host and port.</summary>
+public sealed record CupsEndpoint(string? SocketPath, string Host, int Port)
+{
+    public bool ViaSocket => SocketPath != null;
+    public override string ToString() => SocketPath ?? $"{Host}:{Port}";
 }
 
 /// <summary>
@@ -22,55 +32,87 @@ public sealed class CupsClient : IDisposable
     public const short CupsGetPrinters = 0x4002;
 
     private const int MaxResponseBytes = 16 * 1024 * 1024;
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(5);
     private static readonly string[] SocketCandidates = ["/run/cups/cups.sock", "/var/run/cups/cups.sock", "/private/var/run/cupsd"];
 
     private readonly HttpClient _http;
-    private readonly bool _viaSocket;
-    private readonly string _endpointDescription;
+    private readonly CupsEndpoint _endpoint;
     private int _requestId;
 
-    public CupsClient()
+    public CupsClient() : this(ResolveEndpoint(Environment.GetEnvironmentVariable("CUPS_SERVER"), File.Exists))
     {
-        var handler = new SocketsHttpHandler
-        {
-            PooledConnectionIdleTimeout = TimeSpan.FromSeconds(20),
-            ConnectTimeout = TimeSpan.FromSeconds(5)
-        };
-
-        var (socketPath, host, port) = ResolveServer();
-        if (socketPath != null)
-        {
-            _viaSocket = true;
-            _endpointDescription = socketPath;
-            handler.ConnectCallback = async (_, ct) =>
-            {
-                var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-                try
-                {
-                    await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
-                    return new NetworkStream(socket, ownsSocket: true);
-                }
-                catch
-                {
-                    socket.Dispose();
-                    throw;
-                }
-            };
-            _http = new HttpClient(handler) { BaseAddress = new Uri("http://localhost/") };
-        }
-        else
-        {
-            _endpointDescription = $"{host}:{port}";
-            _http = new HttpClient(handler) { BaseAddress = new Uri($"http://{host}:{port}/") };
-        }
-
-        _http.Timeout = Timeout.InfiniteTimeSpan; // per-call cancellation instead
     }
+
+    public CupsClient(CupsEndpoint endpoint) : this(endpoint, CreateHandler(endpoint))
+    {
+    }
+
+    /// <summary>Uses a custom transport (tests substitute an in-memory IPP server).</summary>
+    public CupsClient(CupsEndpoint endpoint, HttpMessageHandler handler)
+    {
+        _endpoint = endpoint;
+        _http = new HttpClient(handler)
+        {
+            BaseAddress = new Uri(endpoint.ViaSocket ? "http://localhost/" : $"http://{endpoint.Host}:{endpoint.Port}/"),
+            Timeout = Timeout.InfiniteTimeSpan // per-call cancellation instead
+        };
+    }
+
+    public CupsEndpoint Endpoint => _endpoint;
 
     public static string PrinterUri(string printerName) => $"ipp://localhost/printers/{Uri.EscapeDataString(printerName)}";
     public static string JobUri(int jobId) => $"ipp://localhost/jobs/{jobId}";
 
     public static bool IsSuccess(short status) => status < 0x0100;
+
+    /// <summary>
+    /// CUPS_SERVER (a socket path, "host" or "host:port"), else the first existing cupsd socket, else localhost:631.
+    /// </summary>
+    public static CupsEndpoint ResolveEndpoint(string? cupsServer, Func<string, bool> fileExists)
+    {
+        if (!string.IsNullOrWhiteSpace(cupsServer))
+        {
+            var server = cupsServer.Trim();
+            if (server.StartsWith('/')) return new CupsEndpoint(server, "localhost", 631);
+
+            var hostPart = server;
+            int port = 631;
+            int colon = server.LastIndexOf(':');
+            if (colon > 0 && !server.EndsWith(']') && int.TryParse(server[(colon + 1)..], out int p))
+            {
+                hostPart = server[..colon];
+                port = p;
+            }
+            return new CupsEndpoint(null, hostPart, port);
+        }
+
+        foreach (var candidate in SocketCandidates)
+        {
+            if (fileExists(candidate)) return new CupsEndpoint(candidate, "localhost", 631);
+        }
+        return new CupsEndpoint(null, "localhost", 631);
+    }
+
+    /// <summary>
+    /// Checks that cupsd answers IPP. Returns null when ready, otherwise the reason (CUPS not installed,
+    /// not running, or unreachable at the configured endpoint). "No printers" still counts as ready.
+    /// </summary>
+    public async Task<string?> ProbeAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            await SendAsync(CupsGetPrinters, "/", op => op.AddKeyword("requested-attributes", "printer-name"), ct: ct);
+            return null;
+        }
+        catch (CupsException ex) when (ex.IsUnreachable)
+        {
+            return ex.Message;
+        }
+        catch (CupsException)
+        {
+            return null; // e.g. IPP not-found: cupsd is up but has no queues
+        }
+    }
 
     /// <summary>
     /// Sends one IPP request. <paramref name="operation"/> adds operation attributes after the charset,
@@ -105,7 +147,7 @@ public sealed class CupsClient : IDisposable
         try
         {
             response = await PostAsync(resource, header, documentPath, authenticate: false, ct);
-            if (response.StatusCode == HttpStatusCode.Unauthorized && _viaSocket)
+            if (response.StatusCode == HttpStatusCode.Unauthorized && _endpoint.ViaSocket)
             {
                 response.Dispose();
                 response = await PostAsync(resource, header, documentPath, authenticate: true, ct);
@@ -113,7 +155,12 @@ public sealed class CupsClient : IDisposable
         }
         catch (HttpRequestException ex)
         {
-            throw new CupsException($"Cannot reach the CUPS print service at {_endpointDescription} ({ex.Message}). Is cups installed and running?");
+            throw Unreachable(ex.Message);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // The connect timeout surfaces as a cancellation that nobody asked for
+            throw Unreachable($"no answer within {ConnectTimeout.TotalSeconds:0} seconds");
         }
 
         using (response)
@@ -150,7 +197,7 @@ public sealed class CupsClient : IDisposable
 
     /// <summary>
     /// Saves the queue's PPD (GET /printers/{name}.ppd, readable by any user, unlike /etc/cups/ppd).
-    /// Returns false when the queue has none.
+    /// Returns false when the queue has none or CUPS cannot be reached.
     /// </summary>
     public async Task<bool> DownloadPpdAsync(string printerName, string destination, CancellationToken ct = default)
     {
@@ -167,11 +214,20 @@ public sealed class CupsClient : IDisposable
         {
             return false;
         }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return false;
+        }
     }
 
     /// <summary>Synchronous wrapper for the synchronous discovery / queue interfaces.</summary>
     public IppMessage Send(short operationId, string resource, Action<IppAttributeGroup> operation, Action<IppAttributeGroup>? job = null) =>
         SendAsync(operationId, resource, operation, job).GetAwaiter().GetResult();
+
+    public void Dispose() => _http.Dispose();
+
+    private CupsException Unreachable(string detail) =>
+        new($"Cannot reach the CUPS print service at {_endpoint} ({detail}). Is cups installed and running?");
 
     private async Task<HttpResponseMessage> PostAsync(string resource, byte[] header, string? documentPath, bool authenticate, CancellationToken ct)
     {
@@ -187,32 +243,34 @@ public sealed class CupsClient : IDisposable
         return await _http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, ct);
     }
 
-    private static (string? SocketPath, string Host, int Port) ResolveServer()
+    private static SocketsHttpHandler CreateHandler(CupsEndpoint endpoint)
     {
-        var server = Environment.GetEnvironmentVariable("CUPS_SERVER");
-        if (!string.IsNullOrWhiteSpace(server))
+        var handler = new SocketsHttpHandler
         {
-            if (server.StartsWith('/')) return (server, "localhost", 631);
+            PooledConnectionIdleTimeout = TimeSpan.FromSeconds(20),
+            ConnectTimeout = ConnectTimeout
+        };
 
-            var hostPart = server;
-            int port = 631;
-            int colon = server.LastIndexOf(':');
-            if (colon > 0 && !server.EndsWith(']') && int.TryParse(server[(colon + 1)..], out int p))
+        if (endpoint.SocketPath is string socketPath)
+        {
+            handler.ConnectCallback = async (_, ct) =>
             {
-                hostPart = server[..colon];
-                port = p;
-            }
-            return (null, hostPart, port);
+                var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                try
+                {
+                    await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            };
         }
 
-        foreach (var candidate in SocketCandidates)
-        {
-            if (File.Exists(candidate)) return (candidate, "localhost", 631);
-        }
-        return (null, "localhost", 631);
+        return handler;
     }
-
-    public void Dispose() => _http.Dispose();
 
     /// <summary>IPP attributes followed by the (optional) document file, streamed without buffering.</summary>
     private sealed class IppContent : HttpContent

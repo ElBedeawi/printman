@@ -71,7 +71,8 @@ This produces `printman.exe` in the `./publish` directory, ready for deployment.
 `Printman.csproj` picks the target framework from the runtime: `net10.0-windows` for `win-*` (or a plain build on Windows), `net10.0` otherwise. Platform code is excluded by naming convention:
 
 - `*.Windows.cs` and `Services/Windows/`: Windows only (GDI+, WinRT, winspool). `#if WINDOWS` is available for the rare inline case (only `Program.ConfigureServices` uses it).
-- `*.Unix.cs` and `Services/Cups/`: Linux / macOS only (CUPS over IPP, `cupsfilter`).
+- `*.Unix.cs`: Linux / macOS only.
+- `Services/Cups/`: the CUPS implementation (IPP over HTTP, `cupsfilter`). Portable code, compiled everywhere and unit-tested against the in-memory `FakeCupsServer`; registered only in the Linux / macOS build.
 
 Build both before opening a pull request: `dotnet build` and `dotnet build src/Printman -r linux-x64`.
 

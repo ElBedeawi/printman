@@ -25,7 +25,9 @@ This document provides context, architectural constraints, and operational instr
    - All functionality must rely strictly on standard .NET BCL, Microsoft framework references (`Microsoft.AspNetCore.App`, `Microsoft.WindowsDesktop.App`), native Windows SDK / WinRT (`Windows.Data.Pdf`) on Windows, and the system CUPS service and its command-line tools (`cupsfilter`; optionally `pdfinfo` / `qpdf`) on Linux / macOS.
    - **Test-only exemption:** `tests/Printman.Tests` may reference **Microsoft-owned** test packages (MSTest 4 via `MSTest.Sdk`, Microsoft.Testing.Platform). Test dependencies must never flow into `printman.exe` or the published output.
 2. **Platform Code Placement:**
-   - Windows-only code lives in `*.Windows.cs` files or `Services/Windows/`; Linux / macOS-only code in `*.Unix.cs` files or `Services/Cups/`. The csproj removes the other platform's files, so no `#if` is needed except in `Program.ConfigureServices` (`#if WINDOWS`).
+   - Windows-only code lives in `*.Windows.cs` files or `Services/Windows/`; Linux / macOS-only code in `*.Unix.cs` files. The csproj removes the other platform's files, so no `#if` is needed except in `Program` (`#if WINDOWS` around service registration and the CUPS readiness check).
+   - `Services/Cups/` is portable BCL code (IPP over HTTP, process runner) and compiles on every platform so the unit tests cover it with an in-memory cupsd (`tests/Printman.Tests/Fakes/FakeCupsServer.cs`); it is only registered off Windows.
+   - On Linux / macOS, `CupsReadiness.EnsureAsync` runs before every command except `help` / `version`: when cupsd does not answer it prints the install / start commands for the detected package manager (never "install" on macOS, where CUPS is built in) and offers a retry on a terminal, exit code 1 otherwise. `CupsClient` turns connect timeouts into `CupsException` (`IsUnreachable`), never a bare `TaskCanceledException`.
    - Shared code must compile for both: never reference `System.Drawing`, WinRT or `winspool` outside Windows files. Always build both flavours: `dotnet build` and `dotnet build src/Printman -r linux-x64`.
    - Use `OperatingSystem.IsWindows()` for small runtime differences in shared code (e.g. `ShareOptions.DefaultIppPort`: 631 on Windows, 8631 elsewhere).
 3. **Strict Adherence to SOLID Principles:**
@@ -94,7 +96,8 @@ printman/
 │       │   │   ├── CupsPrintService.cs           # Print-Job with the original file; print-to-file via cupsfilter
 │       │   │   ├── CupsPrintQueueService.cs      # Get-Jobs / Get-Printer-Attributes / Cancel-Job
 │       │   │   ├── NoFirewallInspector.cs        # No firewall hints on Unix
-│       │   │   └── ExternalTool.cs               # Runs cupsfilter / pdfinfo / qpdf (argument list, no shell)
+│       │   │   ├── ExternalTool.cs               # IExternalTools: runs cupsfilter / pdfinfo / qpdf (argument list, no shell)
+│       │   │   └── CupsReadiness.cs              # Startup check: cupsd reachable, else install / start hints + retry
 │       │   ├── Ipp/
 │       │   │   ├── IppMessageReader.cs / IppMessageWriter.cs  # application/ipp binary codec
 │       │   │   ├── IppRequestHandler.cs          # IPP Everywhere operations -> pipeline

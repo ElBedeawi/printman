@@ -2,34 +2,50 @@ using System.Diagnostics;
 
 namespace Printman.Services.Cups;
 
+public sealed record ExternalToolResult(int ExitCode, string StandardOutput, string StandardError);
+
 /// <summary>
-/// Runs standard command-line tools (cupsfilter, pdfinfo, qpdf) with an argument list, never a shell string.
+/// Runs standard command-line tools (cupsfilter, pdfinfo, qpdf). Injected so tests can substitute a fake.
 /// </summary>
-public static class ExternalTool
+public interface IExternalTools
+{
+    /// <summary>Full path of <paramref name="name"/> on PATH or in the usual sbin folders, or null.</summary>
+    string? Find(string name);
+
+    /// <summary>
+    /// Runs the tool with an argument list (never a shell string). Standard output goes to
+    /// <paramref name="stdoutFile"/> when given (binary safe), otherwise it is captured.
+    /// </summary>
+    Task<ExternalToolResult> RunAsync(
+        string executable,
+        IEnumerable<string> arguments,
+        string? stdoutFile = null,
+        TimeSpan? timeout = null,
+        CancellationToken ct = default);
+}
+
+public sealed class ExternalTool : IExternalTools
 {
     private static readonly string[] ExtraSearchPaths = ["/usr/sbin", "/usr/local/sbin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
 
-    public sealed record Result(int ExitCode, string StandardOutput, string StandardError);
+    public string? Find(string name) =>
+        Find(name, Environment.GetEnvironmentVariable("PATH"), File.Exists);
 
-    /// <summary>Full path of <paramref name="name"/> on PATH or in the usual sbin folders, or null.</summary>
-    public static string? Find(string name)
+    public static string? Find(string name, string? path, Func<string, bool> fileExists)
     {
-        var dirs = (Environment.GetEnvironmentVariable("PATH") ?? "")
+        var dirs = (path ?? "")
             .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
             .Concat(ExtraSearchPaths);
 
         foreach (var dir in dirs)
         {
             var candidate = Path.Combine(dir, name);
-            if (File.Exists(candidate)) return candidate;
+            if (fileExists(candidate)) return candidate;
         }
         return null;
     }
 
-    /// <summary>
-    /// Runs the tool. Standard output goes to <paramref name="stdoutFile"/> when given (binary safe), otherwise it is captured.
-    /// </summary>
-    public static async Task<Result> RunAsync(
+    public async Task<ExternalToolResult> RunAsync(
         string executable,
         IEnumerable<string> arguments,
         string? stdoutFile = null,
@@ -64,7 +80,7 @@ public static class ExternalTool
             }
 
             await process.WaitForExitAsync(timeoutCts.Token);
-            return new Result(process.ExitCode, stdout, await stderrTask);
+            return new ExternalToolResult(process.ExitCode, stdout, await stderrTask);
         }
         catch (OperationCanceledException)
         {

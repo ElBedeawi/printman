@@ -7,8 +7,20 @@ namespace Printman.Services.Cups;
 /// <summary>
 /// Lists CUPS print queues (CUPS-Get-Printers) with their media, duplex and color capabilities.
 /// </summary>
-public sealed class CupsPrinterDiscoveryService(CupsClient cups) : IPrinterDiscoveryService
+public sealed class CupsPrinterDiscoveryService(
+    CupsClient cups,
+    Func<string, string?> getEnvironmentVariable,
+    string? lpoptionsPath,
+    TextWriter diagnostics) : IPrinterDiscoveryService
 {
+    public CupsPrinterDiscoveryService(CupsClient cups) : this(
+        cups,
+        Environment.GetEnvironmentVariable,
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cups", "lpoptions"),
+        Console.Error)
+    {
+    }
+
     private static readonly string[] RequestedAttributes =
     [
         "printer-name", "printer-info", "printer-make-and-model", "device-uri",
@@ -17,6 +29,9 @@ public sealed class CupsPrinterDiscoveryService(CupsClient cups) : IPrinterDisco
     ];
 
     private readonly CupsClient _cups = cups;
+    private readonly Func<string, string?> _getEnvironmentVariable = getEnvironmentVariable;
+    private readonly string? _lpoptionsPath = lpoptionsPath;
+    private readonly TextWriter _diagnostics = diagnostics;
     private int _warned;
 
     public IReadOnlyList<PrinterInfo> GetPrinters()
@@ -34,7 +49,7 @@ public sealed class CupsPrinterDiscoveryService(CupsClient cups) : IPrinterDisco
         {
             if (Interlocked.Exchange(ref _warned, 1) == 0)
             {
-                Console.Error.WriteLine($"Warning: {ex.Message}");
+                _diagnostics.WriteLine($"Warning: {ex.Message}");
             }
             return [];
         }
@@ -107,28 +122,31 @@ public sealed class CupsPrinterDiscoveryService(CupsClient cups) : IPrinterDisco
     {
         foreach (var variable in new[] { "LPDEST", "PRINTER" })
         {
-            var value = Environment.GetEnvironmentVariable(variable);
+            var value = _getEnvironmentVariable(variable);
             if (!string.IsNullOrWhiteSpace(value) && value != "lp") return StripInstance(value);
         }
 
-        try
+        if (_lpoptionsPath != null && File.Exists(_lpoptionsPath))
         {
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var lpoptions = Path.Combine(home, ".cups", "lpoptions");
-            if (File.Exists(lpoptions))
+            string[] lines;
+            try
             {
-                foreach (var line in File.ReadLines(lpoptions))
+                lines = File.ReadAllLines(_lpoptionsPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                lines = [];
+            }
+
+            foreach (var line in lines)
+            {
+                if (line.StartsWith("Default ", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (line.StartsWith("Default ", StringComparison.OrdinalIgnoreCase))
-                    {
-                        var dest = line[8..].Trim().Split(' ', 2)[0];
-                        if (dest.Length > 0) return StripInstance(dest);
-                    }
+                    var dest = line[8..].Trim().Split(' ', 2)[0];
+                    if (dest.Length > 0) return StripInstance(dest);
                 }
             }
         }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
 
         try
         {
