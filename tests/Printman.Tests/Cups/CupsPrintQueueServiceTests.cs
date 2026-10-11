@@ -224,6 +224,25 @@ public sealed class CupsPrintQueueServiceTests
     }
 
     [TestMethod]
+    [DataRow("media-needed-warning", "Out of Paper")]
+    [DataRow("door-open-error", "Door Open")]
+    [DataRow("interlock-open-error", "Door Open")]
+    [DataRow("offline-error", "Offline")]
+    [DataRow("shutdown", "Offline")]
+    [DataRow("marker-supply-empty-error", "Out of Toner")]
+    [DataRow("paused", "Paused")]
+    [DataRow("input-tray-missing-error", "input-tray-missing")]
+    [DataRow("input-tray-missing-warning", "Ready")]
+    [DataRow("media-low-report", "Ready")]
+    public void GetPrinterStatus_EachStateReason(string reason, string statusText)
+    {
+        var fx = new Fixture();
+        fx.Status(g => g.AddKeyword("printer-state-reasons", reason));
+
+        Assert.AreEqual(statusText, fx.Service.GetPrinterStatus("PDF").StatusText);
+    }
+
+    [TestMethod]
     public void GetPrinterStatus_OfflineAndPaused()
     {
         var fx = new Fixture();
